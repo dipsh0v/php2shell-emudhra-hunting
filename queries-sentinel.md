@@ -10,7 +10,7 @@ Three platform facts shape this whole file.
 
 **This is where the long lookbacks live.** Defender XDR advanced hunting retains 30 days, along with a 10-minute query timeout, a 100,000-row result cap and a 64 MB result size cap. The eMudhra exposure window is seventeen months. If you need to look further back than 30 days, Sentinel is the only place you can.
 
-Every query here parses as published. Where a value has to come from your environment the query ships a working default with the placeholder name in the comment beside it, so you can paste and run first and tune second. Two places need a table or column name only you have: B-S4's custom log leg is commented out, and D-S3 ships Zeek's own field names with a `getschema` step above it.
+Every query here parses as published. Where a value has to come from your environment the query ships a working default with the placeholder name in the comment beside it, so you can paste and run first and tune second. Three places need a table or column name only you have: B-S4's custom log leg is commented out, and B-S7 and D-S3 ship a default table with a `getschema` step above them to confirm the column names.
 
 ## Placeholders used in this file
 
@@ -157,6 +157,8 @@ union isfuzzy=true
 
 **Notes on choices made here.** The `PHPSESSID` test is a regex covering both renderings, because the indicator is `PHPSESSID` as a form field and not the session cookie: AWS WAF logs urlencoded arguments as `PHPSESSID=...` in `Args`, while a multipart header reads `name="PHPSESSID"`, and ModSecurity-style matched-data fields vary in quoting. Matching the bare string instead would pull in every cookie in the estate. `union isfuzzy=true` means the query still runs when one of these tables does not exist in your workspace, which matters because you may have one WAF and not three. The ASIM parser is not inside the union, because `isfuzzy` tolerates missing tables and not missing functions, which is why B-S6 is separate.
 
+**One more body-visible marker, where you can see the body.** Assetnote's scanner (linked in the README) builds its probe around multipart array keys nested roughly 62 levels deep, that is a field name carrying many `[` characters in sequence such as `a[0][0][0]...`. Where your WAF or IDS exposes the raw field name, a run of deeply nested array brackets in a single multipart field name is a structural indicator of this probe shape, independent of the `PHP_SESSION_UPLOAD_PROGRESS` string. It is a hunt, not a detection: some applications legitimately post nested arrays, though rarely to that depth. Add it to the `Blob` tests above if your source carries the field name, for example `Blob matches regex @'(\[[^\]]*\]){20,}'`.
+
 **Evasion.** The multipart field name can be split across header continuations, case-varied, or padded so the marker falls past the WAF's body inspection limit. Cloudflare reported evasion attempts against its own protections within a day of disclosure. Abstract Security also notes that a start-anchored Suricata rule misfires unless body inspection depth is set above your largest legitimate POST, which is the same class of problem on the IDS side.
 
 ## B-S2. CVE-2026-109618 shape: oversized POST bodies to PHP endpoints
@@ -197,7 +199,7 @@ union isfuzzy=true
 | order by RequestBytes desc
 ```
 
-**Triage.** First, group by `Uri` and remove the endpoints that legitimately accept large bodies, then re-run. Second, for the remainder, look at `Status`: a 500 or a 503 on an oversized POST to a PHP endpoint is the interesting combination, and B-S5 chases that directly. Third, take the top source addresses to B-S3 to see whether they came in bursts.
+**Triage.** First, group by `Uri` and remove the endpoints that legitimately accept large bodies, then re-run. Second, for the remainder, look at `Status`: a 500 or a 503 on an oversized POST to a PHP endpoint is the interesting combination, and B-S5 chases that directly. **A 5xx here is not proof of a vulnerable host.** Assetnote documents that a patched build also returns an empty HTTP 500 when an oversized multipart probe exhausts `memory_limit`, on PHP 8.4.27 with low `memory_limit` and on 8.3.36 with a high `max_multipart_body_parts`, so a crash means memory was exhausted, not that the RCE is reachable. Confirm the host's PHP version against A1 before escalating. Third, take the top source addresses to B-S3 to see whether they came in bursts. Watch the phpMyAdmin path `/show_config_errors.php` specifically, which Assetnote's scanner probes as a second entry point when `/index.php` is inconclusive.
 
 **Evasion.** An attacker can keep each request under your threshold and achieve the same memory exhaustion with more requests, or use chunked transfer encoding where some log sources record the size poorly. Setting `post_max_size` down to 8M or 32M at the proxy, which Qualys recommends, both reduces the attack surface and makes this query sharper, because anything above that limit is then anomalous by definition.
 
@@ -336,6 +338,8 @@ union isfuzzy=true
 
 **Gap worth naming.** One published indicator cannot be reached from any of these tables: an HTTP 200 response whose body contains "Allowed memory size". That requires response body logging, which neither access logs nor WAF logs normally provide. If you have a reverse proxy that can log response bodies on 200s for PHP paths, that is the place to add it.
 
+**The empty-500 ambiguity.** The crash signal this query leans on, a 5xx with a high request size, is produced by patched hosts too: Assetnote's scanner reports a false positive on patched PHP 8.4.27 (`memory_limit` 2M to 32M) and 8.3.36 (`max_multipart_body_parts` 2785 or higher), because the oversized body exhausts memory regardless of whether the RCE is present. Treat a hit as "a large POST exhausted memory on this host", then resolve the host's PHP version through A1 to decide whether it is a vulnerable host or a patched host being stressed. A patched host that still crashes under this load is a denial-of-service finding in its own right.
+
 ## B-S6. ASIM variant, for normalised web session data
 
 **Detection candidate or hunt:** hunt. **Needs:** ASIM parsers deployed in the workspace, and a source that populates the optional fields. **Lookback:** anchored to 17 October 2026. **Volume:** as B-S2. **False positives:** as B-S2. **Marked separately from the unions above** because `union isfuzzy=true` tolerates a missing table but not a missing function: if the ASIM parsers are not deployed, this query fails rather than returning nothing.
@@ -373,6 +377,55 @@ ASimWebSessionLogs
 ```
 
 **Triage.** First, check whether `FileName` is populated in your data at all: if it is always empty, the filename indicators are not reachable through ASIM here and you need B-S1. Second, for any populated `FileName` match, pull the raw WAF record. Third, note that `SrcBytes` in form 2 is the whole source-to-destination byte count for the session, not the request body, so a keep-alive session inflates it and the threshold needs to be higher than in B-S2.
+
+## B-S7. Cloudflare and CDN HTTP request logs
+
+**Detection candidate or hunt:** hunt. **Needs:** Cloudflare HTTP request logs in the workspace, via the Cloudflare Logpush connector. The connector version decides the table and column names: recent deployments land data in `Cloudflare_CL`, older ones in a differently named custom log. **Run `Cloudflare_CL | getschema` first and fix the column names below if they differ.** **Lookback:** anchored to 17 October 2026. **Volume:** the size leg is low once scoped to POST; the marker leg should be near zero. **False positives:** the size leg fires on genuine uploads, as B-S2 does. The marker leg is discussed below. **Will miss:** the actual high-value indicator, because Cloudflare Logpush does not carry request bodies, so `PHP_SESSION_UPLOAD_PROGRESS` as a multipart field name is not visible here at all.
+
+Read this before using it, because it is the honest shape of what a CDN access log can and cannot do for php2shell.
+
+**The marker is in the body, and the CDN does not log the body.** `PHP_SESSION_UPLOAD_PROGRESS` is a form field name inside a multipart or urlencoded POST body. Cloudflare Logpush records request metadata, not the body, so the field name never appears in these logs. The URI test below therefore matches only requests that carry the marker in the path or query string, which is what the non-functional public scanners and AI-generated PoCs do, not what a real exploit does, because a real exploit puts it in the body where it belongs. That still has value: catching the scanner noise tells you who is probing you and from where, which is worth having in the weeks the volume is expected to rise. Just do not read a zero here as "not being exploited". The POST-body marker lives in WAF matched-data or IDS data, which is B-S1, or nowhere.
+
+**The size and burst legs are the real CDN signal.** Cloudflare does log request size, so the CVE-2026-109618 shape, a multi-megabyte POST and a burst of them from one source, is visible here exactly as it is in B-S2 and B-S3, and this is the stronger of the two legs. CVE-2026-109619, whose body is about 450 bytes, is invisible to a size rule here as everywhere.
+
+**`phpsessid` in the URI is deliberately not matched.** Old applications legitimately carry `PHPSESSID` in the query string, and a `LIKE '%phpsessid%'` on the URI is almost pure noise. If you want it, add it, but scope it to POST on PHP paths first and expect to tune hard.
+
+**If you run Cloudflare WAF, look at the firewall-events table instead.** Cloudflare shipped a managed rule for this within a day of disclosure, so a blocked attempt lands as a WAF event, not just an HTTP log line. That table, not this one, is where an inspected-and-blocked attempt shows up with the rule that caught it.
+
+```kql
+let huntStart = datetime(2026-10-17 00:00:00);
+let bodyFloor = tolong(1048576);   // <YOUR_MAX_LEGITIMATE_POST_BYTES>: your largest legitimate POST
+let uploadPaths = dynamic(["ZZ_NO_MATCH_ZZ"]);   // <YOUR_UPLOAD_ENDPOINT_PATHS>
+// PHP serialized syntax, case-sensitive: the type letters are case-significant in PHP serialization
+let serialized = @'(O:\d+:"|a:\d+:\{|s:\d+:"|R:\d+;)';
+// Column names are from the current Cloudflare Logpush connector. Confirm with: Cloudflare_CL | getschema
+Cloudflare_CL
+| where TimeGenerated >= huntStart
+| extend Uri = tolower(coalesce(column_ifexists("ClientRequestURI_s", ""), column_ifexists("ClientRequestPath_s", ""))),
+         Method = toupper(tostring(column_ifexists("ClientRequestMethod_s", ""))),
+         SrcIp  = tostring(column_ifexists("ClientIP_s", "")),
+         Host   = tostring(column_ifexists("ClientRequestHost_s", "")),
+         ReqBytes = tolong(column_ifexists("ClientRequestBytes_d", long(null))),
+         Status = toint(column_ifexists("EdgeResponseStatus_d", int(null))),
+         Ua     = tostring(column_ifexists("ClientRequestUserAgent_s", ""))
+| where Method == "POST"
+// leg 1: oversized POST, the 109618 shape. This is the signal that actually works at the CDN.
+// leg 2: the session-upload marker or serialized syntax in the URI or query string, which catches
+//        scanner and PoC traffic only, because the real marker is in the body the CDN does not log.
+| extend OversizedBody = ReqBytes > bodyFloor and not(Uri has_any (uploadPaths))
+| extend UriMarker = Uri contains "php_session_upload_progress"
+                  or Uri matches regex serialized
+| where OversizedBody or UriMarker
+| extend Signal = case(UriMarker and OversizedBody, "oversized POST and URI marker",
+                       UriMarker,                   "URI marker (scanner or PoC, not a body exploit)",
+                                                    "oversized POST body")
+| project TimeGenerated, Signal, SrcIp, Host, Uri, Method, Status, ReqBytes, Ua
+| order by TimeGenerated desc
+```
+
+**Triage.** First, separate the two signals: a `URI marker` row is almost always a scanner or a non-functional PoC, so treat it as reconnaissance intelligence, pivot on `SrcIp`, and feed the address into your blocklist rather than opening a host investigation. Second, work the `oversized POST body` rows as you would B-S2: group by `Uri`, drop the endpoints that legitimately accept large bodies, and look at `Status` for a 5xx on a PHP path. Third, for any source appearing in both legs, or hitting many hosts, escalate, because a source that both probes with the marker and sends oversized bodies is behaving like a campaign rather than a one-off scan.
+
+**Evasion.** A real exploit never appears in the URI leg, by construction. The size leg is defeated by pacing requests under the threshold, the same way B-S2 and B-S3 are, which is why the ASLR brute-force pattern that the working exploit relies on is better caught as a burst, B-S3, than as a single large request.
 
 ---
 

@@ -49,6 +49,13 @@ FalconForce published four hunts for the same two events in their FalconFriday r
 They are not reproduced here. D-D1, D-D2, C-D5 and A5 answer the same questions with an
 independent implementation, and the design notes on each say where the approaches differ.
 
+The original php2shell discovery is credited to the Calif team
+([calif.io/php2shell](https://calif.io/php2shell/)). Assetnote's
+[php2shell-scanner](https://github.com/assetnote/php2shell-scanner) is an active-check tool
+for the same CVEs; several triage caveats here, in particular that a patched host can return
+the same empty HTTP 500 as a vulnerable one, come from its documented behaviour. These
+queries are passive, read-only hunting over telemetry you already hold, not a scanner.
+
 ## How to use this
 
 Start with the three pre-flight queries, P-1, P-2 and D-D0. They take about a minute
